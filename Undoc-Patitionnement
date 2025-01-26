@@ -1,0 +1,209 @@
+•	Gestion des partitions à haut niveau 
+•	Table de pilotage
+•	Création d'une table partitionnée et insertion dans la table de pilotage
+•	Ajout de partitions
+•	Suppressions de partitions
+•	Requête SQL pour voir les informations des partitions d'une table
+
+
+Cette section décrit une approche pouvant être utilisée par les escouades pour la gestion des partitions.
+Impliquer le DBA dans les discussions concernant la stratégie de partitionnement.
+
+Partitions et l'intégrité référentielle
+On ne peut pas tronquer la partition d'une table si elle est une table parent dans une relation d'intégrité référentielle.
+La mise en place du partitionnement signifie qu'une partie de la gestion de l'intégrité référentielle se fera dans le code applicatif.
+Gestion des partitions à haut niveau 
+A chaque jour 
+Lire la table de pilotage
+Pour chacune des tables triée selon le numéro d'ordre (num_ordre)
+Ajouter une partition si nécessaire
+Supprimer une partition si nécessaire
+Ajouter une partition si nécessaire
+Est-ce que la table a le nombre de partitions en avance nécessaire (nombre de partitions minimum + nombre de partitions en avance )
+Si oui, rien
+Sinon ajouter une partition
+
+Supprimer une partition si nécessaire
+Est-ce que la table a des partitions dont la borne inférieure est plus petite que la date du jour du système moins le nombre de partition minimum de la table.
+Si oui, supprimer les partitions
+Sinon  rien
+
+
+Table de pilotage
+L'utilisation d'une table de pilotage permet d'avoir du code générique et flexible.
+Nom des colonnes	Description
+nom_table	nom d'une table partitionnée
+cod_grain	description du grain de la partition, valeurs possibles: annuel, trimestriel, mensuel, quotidien
+nbr_partition_minimum	nombre minimum de partitions à conserver
+nbr_partition_avance	nombre de partitions en avance
+ind_conservation	indique si on désire conserver la dernière partition supprimée (développement futur)
+num_ordre	ordre dans lequel les tables sont traitées
+
+Script de la table de pilotage
+create table parametrage_partition (
+nom_table varchar(200) not null,
+cod_grain varchar(11) not null constraint parametrage_partition_chk1 check(cod_grain in ('annuel','trimestriel','mensuel','quotidien')),
+nbr_partition_minimum smallint not null ,
+nbr_partition_avance smallint not null constraint parametrage_partition_chk2 check (nbr_partition_avance between 1 and 30),
+num_ordre smallint not null constraint parametrage_partition_chk3 check (num_ordre between 1 and 100),
+tms_creation datetimeoffset not null constraint parametrage_partition_defaut1 default sysdatetimeoffset(),
+constraint parametrage_partition_pk primary key (nom_table));
+GO
+
+
+Création d'une table partitionnée et insertion dans la table de pilotage
+Scripts utilisés pour l'exemple, ces scripts sont déployés via Flyway. 
+On démarre avec 6 partitions, les autres partitions seront ajoutés au fur et à mesure.
+create partition function pfmensuel (date) as range RIGHT
+for values ('2024-06-01','2024-07-01','2024-08-01','2024-09-01','2024-10-01')
+create partition scheme psmensuel as partition pfmensuel ALL to ([primary]);
+alter partition scheme psmensuel next used [primary] ; 
+create table evenement_financier (
+   id_evenement_financier bigint             identity,
+   id_entente           bigint               not null,
+   id_carte             bigint               null,
+   id_institution_financiere bigint               not null,
+   id_demande           bigint               null,
+   id_pays              bigint               not null,
+   tms_transaction      date      not null,
+    constraint evenement_financier_pk primary key (id_evenement_financier,tms_transaction) on psmensuel (tms_transaction)
+) on psmensuel (tms_transaction)
+go
+insert into gestion_partitions
+(nom_table, dsc_grain, nbr_partitions_minimum,nbr_partitions_avance, ind_conservation, num_ordre )
+values
+('evenement_financier','mensuel','4',2,0,1);
+
+
+Voici les partitions de la table, aucune rangée dans la table, (voir le script SQL plus bas)
+ 
+
+
+Générons des données de test, dans ce cas-ci 3000 rangées entre 2024-06-01 et le 2024-08-31 
+declare @StartDate AS date;
+declare @EndDate AS date;
+select @StartDate = '2024-06-01',  @EndDate   = '2024-08-31';
+ 
+insert into evenement_financier (id_entente, id_carte, id_institution_financiere,id_demande,id_pays, tms_transaction)  
+select 
+cast(rand(checksum(newid()))*1000000  as int),
+cast(rand(checksum(newid()))*1000000  as int),
+cast(rand(checksum(newid()))*1000000  as int),
+cast(rand(checksum(newid()))*1000000  as int),
+cast(rand(checksum(newid()))*1000000  as int),
+dateadd(day, rand(checksum(newid()))*(1+datediff(day, @StartDate, @EndDate)),@StartDate) as 'la_date' ;
+go 3000
+
+Partitions de la table
+ 
+
+Ajout de partitions
+Déterminer la borne de la dernière partition
+et ajouter une partition selon le grain de la table.
+Le select doit être ajusté selon qu'il est utilisé dans une boucle ou pas pour traiter toutes les tables partitionnées.
+	with borne_superieure as
+(SELECT  max (rv.value) AS borne, t.name as nom_table
+FROM sys.tables AS t  
+JOIN sys.indexes AS i  ON t.object_id = i.object_id  
+JOIN sys.partitions AS p   ON i.object_id = p.object_id AND i.index_id = p.index_id   
+JOIN  sys.partition_schemes AS s  ON i.data_space_id = s.data_space_id  
+JOIN sys.partition_functions AS f  ON s.function_id = f.function_id  
+LEFT JOIN sys.partition_range_values AS r   ON f.function_id = r.function_id and r.boundary_id = p.partition_number  
+LEFT JOIN sys.partition_range_values AS rv  ON f.function_id = rv.function_id AND p.partition_number = rv.boundary_id     
+LEFT JOIN sys.partition_range_values AS rv2  ON f.function_id = rv2.function_id AND p.partition_number - 1= rv2.boundary_id
+WHERE   i.type <= 1 
+group by t.name)
+select case pp.cod_grain when 'annuel' then dateadd (yyyy, 1, convert(date,borne))  
+                         when 'trimestriel' then dateadd (qq, 1, convert(date,borne))  
+                         when 'mensuel' then dateadd (mm, 1, convert(date,borne))  
+                         when 'quotidien' then dateadd (q, 1, convert(date,borne))  end as nouvelle_borne,  pp.nom_table
+from borne_superieure bs join parametrage_partition pp on bs.nom_table =pp.nom_table
+order by pp.num_ordre	nouvelle_borne    nom_table
+2024-11-01    evenement_financier
+Ajouter une partition pour le nouveau mois 
+
+* Bien que l'on utilise une seule destination pour les partitions, il faut néanmoins l'indiquer à Azure SQL, il faut faire un alter partition scheme [] next used [primary]; avant chaque split.	alter partition function <partition_function>() split range (<nouvelle_borne>)
+
+alter partition scheme [evenement_financier_mensuel] next used [primary]; *
+alter partition function pfmensuel() split range ('2024-11-01')
+ 	
+
+
+Partitions de la table suite a l'ajout d'une partition, il y a maintenant 7partitions.
+ 
+
+
+
+Suppressions de partitions
+On supprime toutes les partitions dont la borne inférieure est plus petite que la date du jour du système (prend en compte le temps UTC) moins le nombre de partition minimum de la table.
+Supprimer une partition se fait en deux étapes, supprimer les données puis joindre la partition ciblée à la partition suivante
+Déterminer les bornes dépassant la date actuelle moins le nombre de 
+partitions à conserver plus un car on ne compte pas le mois courant
+
+
+*Cette requête peut ramener plus d'une rangée si la suppression des
+partitions n'a pas été exécuté depuis longtemps. 
+Le code doit imbriqué cette requête dans une boucle pour pouvoir
+ supprimer plusieurs partitions si la tâche d'épuration n'a pas été lancé depuis longtemps.
+Ici la table à purger est dans une variable pour le besoin de l'exemple.
+
+	declare @vtable_a_traiter varchar(100) = 'evenement_financier' *
+SELECT  rv.value, p.partition_number
+FROM sys.tables AS t  
+JOIN sys.indexes AS i      ON t.object_id = i.object_id  
+JOIN sys.partitions AS p      ON i.object_id = p.object_id AND i.index_id = p.index_id   
+JOIN  sys.partition_schemes AS s       ON i.data_space_id = s.data_space_id  
+JOIN sys.partition_functions AS f      ON s.function_id = f.function_id  
+LEFT JOIN sys.partition_range_values AS r       ON f.function_id = r.function_id and r.boundary_id = p.partition_number  
+LEFT JOIN sys.partition_range_values AS rv    ON f.function_id = rv.function_id    AND p.partition_number = rv.boundary_id     
+LEFT JOIN sys.partition_range_values AS rv2    ON f.function_id = rv2.function_id    AND p.partition_number - 1= rv2.boundary_id,
+parametrage_partition pp
+WHERE   t.name= @vtable_a_traiter    AND i.type <= 1 
+and   t.name =pp.nom_table
+and  rv.value < case cod_grain when 'annuel' then dateadd (yyyy,((pp.nbr_partition_minimum+1)*-1), cast(SYSDATETIMEOFFSET() AT TIME ZONE 'Eastern Standard Time' AS datetime2) )   
+                               when 'trimestriel' then dateadd (qq,((pp.nbr_partition_minimum+1)*-1), cast(SYSDATETIMEOFFSET() AT TIME ZONE 'Eastern Standard Time' AS datetime2) )     
+                                       when 'mensuel' then dateadd (mm,((pp.nbr_partition_minimum+1)*-1), cast(SYSDATETIMEOFFSET() AT TIME ZONE 'Eastern Standard Time' AS datetime2) )    
+                                       when 'quotidien' then dateadd (q,((pp.nbr_partition_minimum+1)*-1), cast(SYSDATETIMEOFFSET() AT TIME ZONE 'Eastern Standard Time' AS datetime2) )  end    
+order by 1 asc	value                                 partition_number
+2024-06-01 00:00:00.000    1
+2024-07-01 00:00:00.000    2
+Supprimer les données de
+la plus vieille partition	Il faut supprimer les données de la partition trouvée à l'étape précédente,  
+truncate table evenement_financier with (partitions (1)); 	
+Supprimer la partition en la joignant 
+à la partition suivante	alter partition function pfmensuel() merge range ('2024-06-01 00:00:00.000')
+
+Les données de juin 2024 sont maintenant supprimées et la partition éliminée.	
+
+Partitions de la table suite à la suppression d'une partition
+ 
+
+A noter que le numéro de partition n'est pas absolu, la première partition a toujours le numéro 1.
+S'il y a plusieurs partitions à supprimer, il faut exécuter la requête qui affiche le numéro de partition et la borne à chaque fois pour supprimer la bonne partition.
+
+
+
+Requête SQL pour voir les informations des partitions d'une table
+SELECT SCHEMA_NAME(t.schema_id) AS SchemaName, t.name AS TableName, i.name AS IndexName, 
+    p.partition_number AS PartitionNumber, f.name AS PartitionFunctionName, p.rows AS Rows, rv.value AS BoundaryValue, 
+CASE WHEN ISNULL(rv.value, rv2.value) IS NULL THEN 'N/A' 
+ELSE
+    CASE WHEN f.boundary_value_on_right = 0 AND rv2.value IS NULL THEN '>=' 
+        WHEN f.boundary_value_on_right = 0 THEN '>' 
+        ELSE '>=' 
+    END + ' ' + ISNULL(CONVERT(varchar(64), rv2.value), 'Min Value') + ' ' + 
+        CASE f.boundary_value_on_right WHEN 1 THEN 'and <' 
+                ELSE 'and <=' END 
+        + ' ' + ISNULL(CONVERT(varchar(64), rv.value), 'Max Value') 
+END AS TextComparison
+FROM sys.tables AS t  
+JOIN sys.indexes AS i      ON t.object_id = i.object_id  
+JOIN sys.partitions AS p      ON i.object_id = p.object_id AND i.index_id = p.index_id   
+JOIN  sys.partition_schemes AS s       ON i.data_space_id = s.data_space_id  
+JOIN sys.partition_functions AS f      ON s.function_id = f.function_id  
+LEFT JOIN sys.partition_range_values AS r       ON f.function_id = r.function_id and r.boundary_id = p.partition_number  
+LEFT JOIN sys.partition_range_values AS rv    ON f.function_id = rv.function_id    AND p.partition_number = rv.boundary_id     
+LEFT JOIN sys.partition_range_values AS rv2    ON f.function_id = rv2.function_id    AND p.partition_number - 1= rv2.boundary_id
+WHERE  t.name= '<nom_de_la_table>'    AND i.type <= 1 
+ORDER BY t.name,  p.partition_number;
+
